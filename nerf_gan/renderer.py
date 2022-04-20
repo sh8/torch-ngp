@@ -285,6 +285,7 @@ class NeRFRenderer(nn.Module):
         }
 
     def run_cuda(self,
+                 z,
                  rays_o,
                  rays_d,
                  dt_gamma=0,
@@ -321,10 +322,13 @@ class NeRFRenderer(nn.Module):
                 self.mean_density, nears, fars, counter, self.mean_count,
                 perturb, 128, force_all_rays, dt_gamma)
 
-            #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
+            z = z.repeat(xyzs.shape[0], 1)
+            z = z.to(device)
+
+            # plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
 
             density_outputs = self.density(
-                xyzs
+                xyzs, z
             )  # [M,], use a dict since it may include extra things, like geo_feat for rgb.
             sigmas = density_outputs['sigma']
             sigmas = self.density_scale * sigmas
@@ -384,10 +388,12 @@ class NeRFRenderer(nn.Module):
                     n_alive, n_step, rays_alive[i % 2], rays_t[i % 2], rays_o,
                     rays_d, self.bound, self.density_grid, self.mean_density,
                     nears, fars, 128, perturb, dt_gamma)
+                z = z.repeat(xyzs.shape[0], 1)
+                z = z.to(device)
 
                 #sigmas, rgbs = self(xyzs, dirs)
                 density_outputs = self.density(
-                    xyzs
+                    xyzs, z
                 )  # [M,], use a dict since it may include extra things, like geo_feat for rgb.
                 sigmas = density_outputs['sigma']
                 sigmas = self.density_scale * sigmas
@@ -402,6 +408,9 @@ class NeRFRenderer(nn.Module):
                 step += n_step
                 i += 1
 
+        print(image.shape)
+        print(weights_sum.shape)
+        print(bg_color.shape)
         image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
         image = image.view(*prefix, 3)
 
@@ -494,7 +503,7 @@ class NeRFRenderer(nn.Module):
         #print(f'[mark untrained grid] {(count == 0).sum()} from {resolution ** 3 * self.cascade}')
 
     @torch.no_grad()
-    def update_extra_state(self, decay=0.95, S=128):
+    def update_extra_state(self, z, decay=0.99, S=128):
         # call before each epoch to update extra states.
 
         if not self.cuda_ray:
@@ -536,9 +545,10 @@ class NeRFRenderer(nn.Module):
                         cas_xyzs += (torch.rand_like(cas_xyzs) * 2 -
                                      1) * half_grid_size
                         # query density
-                        sigmas = self.density(cas_xyzs.to(
-                            tmp_grid.device))['sigma'].reshape(lx, ly,
-                                                               lz).detach()
+                        cas_xyzs = cas_xyzs.to(tmp_grid.device)
+                        z = z.repeat(cas_xyzs.shape[0], 1).to(tmp_grid.device)
+                        sigmas = self.density(cas_xyzs, z)['sigma']
+                        sigmas = sigmas.reshape(lx, ly, lz).detach()
                         # magic scale from `scalbnf(MIN_CONE_STEPSIZE(), 0)`, check `splat_grid_samples_nerf_max_nearest_neighbor`
                         sigmas *= self.density_scale * 0.001691
                         # assign
@@ -562,6 +572,7 @@ class NeRFRenderer(nn.Module):
         #print(f'[density grid] min={self.density_grid.min().item():.4f}, max={self.density_grid.max().item():.4f}, mean={self.mean_density:.4f}, occ_rate={(self.density_grid > 0.01).sum() / (128**3 * self.cascade):.3f} | [step counter] mean={self.mean_count}')
 
     def render(self,
+               z,
                rays_o,
                rays_d,
                staged=False,
@@ -578,35 +589,12 @@ class NeRFRenderer(nn.Module):
             _run = self.run
 
         B, N = rays_o.shape[:2]
-        device = rays_o.device
 
-        # never stage when cuda_ray
-        if staged and not self.cuda_ray:
-            depth = torch.empty((B, N), device=device)
-            image = torch.empty((B, N, 3), device=device)
-
-            for b in range(B):
-                head = 0
-                while head < N:
-                    tail = min(head + max_ray_batch, N)
-                    results_ = _run(rays_o[b:b + 1, head:tail],
-                                    rays_d[b:b + 1, head:tail],
-                                    bg_color=bg_color,
-                                    perturb=perturb,
-                                    **kwargs)
-                    depth[b:b + 1, head:tail] = results_['depth']
-                    image[b:b + 1, head:tail] = results_['image']
-                    head += max_ray_batch
-
-            results = {}
-            results['depth'] = depth
-            results['image'] = image
-
-        else:
-            results = _run(rays_o,
-                           rays_d,
-                           bg_color=bg_color,
-                           perturb=perturb,
-                           **kwargs)
+        results = _run(z,
+                       rays_o,
+                       rays_d,
+                       bg_color=bg_color,
+                       perturb=perturb,
+                       **kwargs)
 
         return results

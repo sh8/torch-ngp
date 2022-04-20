@@ -17,6 +17,7 @@ class NeRFNetwork(NeRFRenderer):
                  num_layers=2,
                  hidden_dim=64,
                  geo_feat_dim=15,
+                 latent_dim=32,
                  num_layers_color=3,
                  hidden_dim_color=64,
                  bound=1,
@@ -27,6 +28,7 @@ class NeRFNetwork(NeRFRenderer):
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.geo_feat_dim = geo_feat_dim
+        self.latent_dim = latent_dim
 
         per_level_scale = np.exp2(np.log2(2048 * bound / 16) / (16 - 1))
 
@@ -43,7 +45,7 @@ class NeRFNetwork(NeRFRenderer):
         )
 
         self.sigma_net = tcnn.Network(
-            n_input_dims=32,
+            n_input_dims=32 + self.latent_dim,
             n_output_dims=1 + self.geo_feat_dim,
             network_config={
                 "otype": "FullyFusedMLP",
@@ -106,12 +108,13 @@ class NeRFNetwork(NeRFRenderer):
 
         return sigma, color
 
-    def density(self, x):
+    def density(self, x, z):
         # x: [N, 3], in [-bound, bound]
-
         x = (x + self.bound) / (2 * self.bound)  # to [0, 1]
         x = self.encoder(x)
+        x = torch.cat([x, z], dim=-1)
         h = self.sigma_net(x)
+        # print(h.shape)
 
         #sigma = F.relu(h[..., 0])
         sigma = trunc_exp(h[..., 0])

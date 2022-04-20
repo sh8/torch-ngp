@@ -134,12 +134,12 @@ if __name__ == '__main__':
 
     if opt.ff:
         opt.fp16 = True
-        from nerf.network_ff import NeRFNetwork
+        from nerf_gan.network_ff import NeRFNetwork
     elif opt.tcnn:
         opt.fp16 = True
-        from nerf.network_tcnn import NeRFNetwork
+        from nerf_gan.network_tcnn import NeRFNetwork
     else:
-        from nerf.network import NeRFNetwork
+        from nerf_gan.network import NeRFNetwork
 
     print(opt)
 

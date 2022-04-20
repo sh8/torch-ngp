@@ -39,13 +39,12 @@ def custom_meshgrid(*args):
 
 
 @torch.cuda.amp.autocast(enabled=False)
-def get_rays(poses, intrinsics, H, W, N=-1, error_map=None):
+def get_rays(poses, intrinsics, H, W, N=-1):
     ''' get rays
     Args:
         poses: [B, 4, 4], cam2world
         intrinsics: [4]
         H, W, N: int
-        error_map: [B, 128 * 128], sample probability based on training error
     Returns:
         rays_o, rays_d: [B, N, 3]
         inds: [B, N]
@@ -65,30 +64,9 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None):
     if N > 0:
         N = min(N, H * W)
 
-        if error_map is None:
-            inds = torch.randint(0, H * W, size=[N],
-                                 device=device)  # may duplicate
-            inds = inds.expand([B, N])
-        else:
-
-            # weighted sample on a low-reso grid
-            inds_coarse = torch.multinomial(
-                error_map.to(device), N,
-                replacement=False)  # [B, N], but in [0, 128*128)
-
-            # map to the original resolution with random perturb.
-            inds_x, inds_y = inds_coarse // 128, inds_coarse % 128  # `//` will throw a warning in torch 1.10... anyway.
-            sx, sy = H / 128, W / 128
-            inds_x = (inds_x * sx +
-                      torch.rand(B, N, device=device) * sx).long().clamp(
-                          max=H - 1)
-            inds_y = (inds_y * sy +
-                      torch.rand(B, N, device=device) * sy).long().clamp(
-                          max=W - 1)
-            inds = inds_x * W + inds_y
-
-            results[
-                'inds_coarse'] = inds_coarse  # need this when updating error_map
+        inds = torch.randint(0, H * W, size=[N],
+                             device=device)  # may duplicate
+        inds = inds.expand([B, N])
 
         i = torch.gather(i, -1, inds)
         j = torch.gather(j, -1, inds)
@@ -401,35 +379,10 @@ class Trainer(object):
 
     ### ------------------------------
 
-    def train_step(self, data):
+    def train_step(self, data, z):
 
         rays_o = data['rays_o']  # [B, N, 3]
         rays_d = data['rays_d']  # [B, N, 3]
-
-        # if there is no gt image, we train with CLIP loss.
-        if 'images' not in data:
-
-            B, N = rays_o.shape[:2]
-            H, W = data['H'], data['W']
-
-            # currently fix white bg, MUST force all rays!
-            outputs = self.model.render(rays_o,
-                                        rays_d,
-                                        staged=False,
-                                        bg_color=None,
-                                        perturb=True,
-                                        force_all_rays=True,
-                                        **vars(self.opt))
-            pred_rgb = outputs['image'].reshape(B, H, W,
-                                                3).permute(0, 3, 1,
-                                                           2).contiguous()
-
-            # [debug] uncomment to plot the images used in train_step
-            #torch_vis_2d(pred_rgb[0])
-
-            loss = self.clip_loss(pred_rgb)
-
-            return pred_rgb, None, loss
 
         images = data['images']  # [B, N, 3/4]
 
@@ -448,7 +401,8 @@ class Trainer(object):
             bg_color = None
             gt_rgb = images
 
-        outputs = self.model.render(rays_o,
+        outputs = self.model.render(z,
+                                    rays_o,
                                     rays_d,
                                     staged=False,
                                     bg_color=bg_color,
@@ -459,31 +413,6 @@ class Trainer(object):
 
         loss = self.criterion(pred_rgb,
                               gt_rgb).mean(-1)  # [B, N, 3] --> [B, N]
-
-        # update error_map
-        if self.error_map is not None:
-            index = data['index']  # [B]
-            inds = data['inds_coarse']  # [B, N]
-
-            # take out, this is an advanced indexing and the copy is unavoidable.
-            error_map = self.error_map[index]  # [B, H * W]
-
-            # [debug] uncomment to save and visualize error map
-            # if self.global_step % 1001 == 0:
-            #     tmp = error_map[0].view(128, 128).cpu().numpy()
-            #     print(f'[write error map] {tmp.shape} {tmp.min()} ~ {tmp.max()}')
-            #     tmp = (tmp - tmp.min()) / (tmp.max() - tmp.min())
-            #     cv2.imwrite(os.path.join(self.workspace, f'{self.global_step}.jpg'), (tmp * 255).astype(np.uint8))
-
-            error = loss.detach().to(
-                error_map.device)  # [B, N], already in [0, 1]
-
-            # ema update
-            ema_error = 0.1 * error_map.gather(1, inds) + 0.9 * error
-            error_map.scatter_(1, inds, ema_error)
-
-            # put back
-            self.error_map[index] = error_map
 
         loss = loss.mean()
 
@@ -581,9 +510,6 @@ class Trainer(object):
             self.model.mark_untrained_grid(train_loader._data.poses,
                                            train_loader._data.intrinsics)
 
-        # get a ref to error_map
-        self.error_map = train_loader._data.error_map
-
         for epoch in range(self.epoch, max_epochs + 1):
             self.epoch = epoch
 
@@ -647,70 +573,6 @@ class Trainer(object):
                 pbar.update(loader.batch_size)
 
         self.log(f"==> Finished Test.")
-
-    # [GUI] just train for 16 steps, without any other overhead that may slow down rendering.
-    def train_gui(self, train_loader, step=16):
-
-        self.model.train()
-
-        total_loss = torch.tensor([0], dtype=torch.float32, device=self.device)
-
-        loader = iter(train_loader)
-
-        for _ in range(step):
-
-            # mimic an infinite loop dataloader (in case the total dataset is smaller than step)
-            try:
-                data = next(loader)
-            except StopIteration:
-                loader = iter(train_loader)
-                data = next(loader)
-
-            # mark untrained grid
-            if self.global_step == 0:
-                self.model.mark_untrained_grid(train_loader._data.poses,
-                                               train_loader._data.intrinsics)
-                self.error_map = train_loader._data.error_map
-
-            # update grid every 16 steps
-            if self.model.cuda_ray and self.global_step % 16 == 0:
-                with torch.cuda.amp.autocast(enabled=self.fp16):
-                    self.model.update_extra_state()
-
-            self.global_step += 1
-
-            self.optimizer.zero_grad()
-
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
-
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-
-            if self.scheduler_update_every_step:
-                self.lr_scheduler.step()
-
-            total_loss += loss.detach()
-
-        if self.ema is not None:
-            self.ema.update()
-
-        average_loss = total_loss.item() / step
-
-        if not self.scheduler_update_every_step:
-            if isinstance(self.lr_scheduler,
-                          torch.optim.lr_scheduler.ReduceLROnPlateau):
-                self.lr_scheduler.step(average_loss)
-            else:
-                self.lr_scheduler.step()
-
-        outputs = {
-            'loss': average_loss,
-            'lr': self.optimizer.param_groups[0]['lr'],
-        }
-
-        return outputs
 
     # [GUI] test on a single image
     def test_gui(self,
@@ -785,9 +647,9 @@ class Trainer(object):
         self.model.train()
 
         # update grid
-        if self.model.cuda_ray:
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                self.model.update_extra_state()
+        # if self.model.cuda_ray:
+        #     with torch.cuda.amp.autocast(enabled=self.fp16):
+        #         self.model.update_extra_state()
 
         # distributedSampler: must call set_epoch() to shuffle indices across multiple epochs
         # ref: https://pytorch.org/docs/stable/data.html
@@ -810,8 +672,13 @@ class Trainer(object):
 
             self.optimizer.zero_grad()
 
+            z = torch.rand((1, 32))
+
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
+                self.model.update_extra_state(z)
+
+            with torch.cuda.amp.autocast(enabled=self.fp16):
+                preds, truths, loss = self.train_step(data, z)
 
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
