@@ -321,7 +321,7 @@ class NeRFRenderer(nn.Module):
                 self.mean_density, nears, fars, counter, self.mean_count,
                 perturb, 128, force_all_rays, dt_gamma)
 
-            #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
+            # plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
 
             density_outputs = self.density(
                 xyzs

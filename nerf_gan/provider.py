@@ -146,7 +146,10 @@ class NeRFDataset:
             transform_paths = glob.glob(
                 os.path.join(self.root_path, obj_id, '**/cameras.npz'))
 
-            transform = {'h': 128, 'w': 128, 'frames': []}
+            if 'ShapeNet' in self.root_path:
+                transform = {'h': 256, 'w': 256}
+            else:
+                transform = {'h': 64, 'w': 64}
 
             # Load intrinsics
             transform_path = transform_paths[0]
@@ -171,6 +174,7 @@ class NeRFDataset:
                                                        f'image/{i:04d}.png')
                     file_path = file_path.replace(self.root_path, '', 1)[1:]
                     R = np.eye(4)
+                    R[1, 1] = -1.0
                     R[2, 2] = -1.0
                     Rt = poses[f'world_mat_inv_{i}']
                     transform_mat = Rt @ R
@@ -260,8 +264,11 @@ class NeRFDataset:
                 if not os.path.exists(f_path):
                     continue
 
-                image = cv2.imread(
-                    f_path, cv2.IMREAD_UNCHANGED)  # [H, W, 3] o [H, W, 4]
+                if self.mode == 'shapenet':
+                    image = cv2.imread(f_path)  # [H, W, 3]
+                else:
+                    image = cv2.imread(
+                        f_path, cv2.IMREAD_UNCHANGED)  # [H, W, 3] o [H, W, 4]
                 # add support for the alpha channel as a mask.
                 if image.shape[-1] == 3:
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)

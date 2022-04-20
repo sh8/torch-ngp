@@ -142,6 +142,41 @@ class NeRFDataset:
                         os.path.join(self.root_path,
                                      f'transforms_{type}.json'), 'r') as f:
                     transform = json.load(f)
+        elif self.mode == 'shapenet':
+            # obj_id = '03001627'  # chair
+            obj_id = '02691156'
+            transform_path = glob.glob(
+                os.path.join(self.root_path, obj_id, '**/cameras.npz'))[20]
+
+            if 'ShapeNet' in self.root_path:
+                transform = {'h': 256, 'w': 256}
+            else:
+                transform = {'h': 64, 'w': 64}
+
+            # Load intrinsics
+            poses = np.load(transform_path)
+            K = poses['camera_mat_0']
+            transform['fl_x'] = K[0, 0] * transform['w'] // 2
+            transform['fl_y'] = K[1, 1] * transform['h'] // 2
+            transform['cx'] = transform['w'] // 2
+            transform['cy'] = transform['h'] // 2
+            poses = np.load(transform_path)
+            num_imgs = len(poses.files) // 4
+            frames = []
+            for i in range(num_imgs):
+                file_path = transform_path.replace('cameras.npz',
+                                                   f'image/{i:04d}.png')
+                file_path = file_path.replace(self.root_path, '', 1)[1:]
+                R = np.eye(4)
+                R[1, 1] = -1.0
+                R[2, 2] = -1.0
+                Rt = poses[f'world_mat_inv_{i}']
+                transform_mat = Rt @ R
+                frame = {}
+                frame['file_path'] = file_path
+                frame['transform_matrix'] = transform_mat.tolist()
+                frames.append(frame)
+            transform['frames'] = frames
         else:
             raise NotImplementedError(f'unknown dataset mode: {self.mode}')
 
@@ -205,8 +240,11 @@ class NeRFDataset:
                                 dtype=np.float32)  # [4, 4]
                 pose = nerf_matrix_to_ngp(pose, scale=self.scale)
 
-                image = cv2.imread(
-                    f_path, cv2.IMREAD_UNCHANGED)  # [H, W, 3] o [H, W, 4]
+                if self.mode == 'shapenet':
+                    image = cv2.imread(f_path)  # [H, W, 3]
+                else:
+                    image = cv2.imread(
+                        f_path, cv2.IMREAD_UNCHANGED)  # [H, W, 3] o [H, W, 4]
                 if self.H is None or self.W is None:
                     self.H = image.shape[0] // downscale
                     self.W = image.shape[1] // downscale
