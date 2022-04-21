@@ -21,6 +21,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
+from torch import autograd
 
 import trimesh
 import mcubes
@@ -75,6 +76,59 @@ def get_rays(poses, intrinsics, H, W, N=-1):
 
     else:
         inds = torch.arange(H * W, device=device).expand([B, H * W])
+
+    zs = torch.ones_like(i)
+    xs = (i - cx) / fx * zs
+    ys = (j - cy) / fy * zs
+    directions = torch.stack((xs, ys, zs), dim=-1)
+    directions = directions / torch.norm(directions, dim=-1, keepdim=True)
+    rays_d = directions @ poses[:, :3, :3].transpose(-1, -2)  # (B, N, 3)
+
+    rays_o = poses[..., :3, 3]  # [B, 3]
+    rays_o = rays_o[..., None, :].expand_as(rays_d)  # [B, N, 3]
+
+    results['rays_o'] = rays_o
+    results['rays_d'] = rays_d
+
+    return results
+
+
+@torch.cuda.amp.autocast(enabled=False)
+def get_rays_from_grids(poses, intrinsics, H, W, grid_size):
+    ''' get rays
+    Args:
+        poses: [B, 4, 4], cam2world
+        intrinsics: [4]
+        H, W, grid_size: int
+    Returns:
+        rays_o, rays_d: [B, N, 3]
+        inds: [B, N]
+    '''
+    B = poses.shape[0]
+    grid_x = torch.randint(0, W // grid_size, size=[1])[0] * grid_size
+    grid_y = torch.randint(0, H // grid_size, size=[1])[0] * grid_size
+
+    device = poses.device
+    B = poses.shape[0]
+    fx, fy, cx, cy = intrinsics
+
+    i, j = custom_meshgrid(torch.linspace(0, W - 1, W, device=device),
+                           torch.linspace(0, H - 1, H, device=device))
+    i = i.t().reshape([1, H * W]).expand([B, H * W]) + 0.5
+    j = j.t().reshape([1, H * W]).expand([B, H * W]) + 0.5
+
+    results = {}
+
+    inds_y, inds_x = torch.meshgrid(torch.arange(grid_size, device=device),
+                                    torch.arange(grid_size, device=device),
+                                    indexing='ij')
+    inds = (grid_x + inds_x) + (grid_y + inds_y) * W
+    inds = inds.reshape(-1).expand([B, grid_size * grid_size])
+
+    i = torch.gather(i, -1, inds)
+    j = torch.gather(j, -1, inds)
+
+    results['inds'] = inds
 
     zs = torch.ones_like(i)
     xs = (i - cx) / fx * zs
@@ -221,29 +275,29 @@ class PSNRMeter:
 class Trainer(object):
 
     def __init__(
-            self,
-            name,  # name of this experiment
-            opt,  # extra conf
-            model,  # network 
-            criterion=None,  # loss function, if None, assume inline implementation in train_step
-            optimizer=None,  # optimizer
-            ema_decay=None,  # if use EMA, set the decay
-            lr_scheduler=None,  # scheduler
-            metrics=[],  # metrics for evaluation, if None, use val_loss to measure performance, else use the first metric.
-            local_rank=0,  # which GPU am I
-            world_size=1,  # total num of GPUs
-            device=None,  # device to use, usually setting to None is OK. (auto choose device)
-            mute=False,  # whether to mute all print
-            fp16=False,  # amp optimize level
-            eval_interval=1,  # eval once every $ epoch
-            max_keep_ckpt=2,  # max num of saved ckpts in disk
-            workspace='workspace',  # workspace to save logs & ckpts
-            best_mode='min',  # the smaller/larger result, the better
-            use_loss_as_metric=True,  # use loss as the first metric
-            report_metric_at_train=False,  # also report metrics at training
-            use_checkpoint="latest",  # which ckpt to use at init time
-            use_tensorboardX=True,  # whether to use tensorboard for logging
-            scheduler_update_every_step=False,  # whether to call scheduler.step() after every train step
+        self,
+        name,  # name of this experiment
+        opt,  # extra conf
+        model,  # network 
+        discriminator=None,  # discriminator
+        d_optimizer=None,  # optimizer
+        g_optimizer=None,  # optimizer
+        ema_decay=None,  # if use EMA, set the decay
+        metrics=[],  # metrics for evaluation, if None, use val_loss to measure performance, else use the first metric.
+        local_rank=0,  # which GPU am I
+        world_size=1,  # total num of GPUs
+        device=None,  # device to use, usually setting to None is OK. (auto choose device)
+        mute=False,  # whether to mute all print
+        fp16=False,  # amp optimize level
+        eval_interval=1,  # eval once every $ epoch
+        max_keep_ckpt=2,  # max num of saved ckpts in disk
+        workspace='workspace',  # workspace to save logs & ckpts
+        best_mode='min',  # the smaller/larger result, the better
+        use_loss_as_metric=True,  # use loss as the first metric
+        report_metric_at_train=False,  # also report metrics at training
+        use_checkpoint="latest",  # which ckpt to use at init time
+        use_tensorboardX=True,  # whether to use tensorboard for logging
+        # scheduler_update_every_step=False,  # whether to call scheduler.step() after every train step
     ):
 
         self.name = name
@@ -263,10 +317,11 @@ class Trainer(object):
         self.use_checkpoint = use_checkpoint
         self.use_tensorboardX = use_tensorboardX
         self.time_stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-        self.scheduler_update_every_step = scheduler_update_every_step
+        # self.scheduler_update_every_step = scheduler_update_every_step
         self.device = device if device is not None else torch.device(
             f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
         self.console = Console()
+        self.critic_iter = 5
 
         model.to(self.device)
         if self.world_size > 1:
@@ -275,22 +330,25 @@ class Trainer(object):
                 model, device_ids=[local_rank])
         self.model = model
 
-        if isinstance(criterion, nn.Module):
-            criterion.to(self.device)
-        self.criterion = criterion
+        if discriminator is not None:
+            discriminator.to(self.device)
+            self.discriminator = discriminator
 
-        if optimizer is None:
-            self.optimizer = optim.Adam(self.model.parameters(),
-                                        lr=0.001,
-                                        weight_decay=5e-4)  # naive adam
-        else:
-            self.optimizer = optimizer(self.model)
+        # if isinstance(criterion, nn.Module):
+        #     criterion.to(self.device)
+        # self.criterion = criterion
 
-        if lr_scheduler is None:
-            self.lr_scheduler = optim.lr_scheduler.LambdaLR(
-                self.optimizer, lr_lambda=lambda epoch: 1)  # fake scheduler
-        else:
-            self.lr_scheduler = lr_scheduler(self.optimizer)
+        if g_optimizer is not None:
+            self.g_optimizer = g_optimizer(self.model)
+
+        if d_optimizer is not None and self.discriminator is not None:
+            self.d_optimizer = d_optimizer(self.discriminator)
+
+        # if lr_scheduler is None:
+        #     self.lr_scheduler = optim.lr_scheduler.LambdaLR(
+        #         self.optimizer, lr_lambda=lambda epoch: 1)  # fake scheduler
+        # else:
+        #     self.lr_scheduler = lr_scheduler(self.optimizer)
 
         if ema_decay is not None:
             self.ema = ExponentialMovingAverage(self.model.parameters(),
@@ -379,27 +437,44 @@ class Trainer(object):
 
     ### ------------------------------
 
+    def calculate_gradient_penalty(self, real_images, fake_images):
+        B = real_images.shape[0]
+        eta = torch.FloatTensor(B, 1, 1, 1).uniform_(0, 1)
+        eta = eta.expand(B, real_images.size(1), real_images.size(2),
+                         real_images.size(3))
+        eta = eta.cuda()
+
+        interpolated = eta * real_images + ((1 - eta) * fake_images)
+        interpolated = interpolated.cuda()
+
+        # define it to calculate gradient
+        interpolated.requires_grad_()
+
+        # calculate probability of interpolated examples
+        prob_interpolated = self.discriminator(interpolated)
+
+        # calculate gradients of probabilities with respect to examples
+        gradients = autograd.grad(outputs=prob_interpolated,
+                                  inputs=interpolated,
+                                  grad_outputs=torch.ones(
+                                      prob_interpolated.size()).cuda(),
+                                  create_graph=True,
+                                  retain_graph=True)[0]
+
+        grad_penalty = ((gradients.norm(2, dim=1) - 1)**2).mean() * 10.0
+        return grad_penalty
+
     def train_step(self, data, z):
 
         rays_o = data['rays_o']  # [B, N, 3]
         rays_d = data['rays_d']  # [B, N, 3]
-
         images = data['images']  # [B, N, 3/4]
 
         B, N, C = images.shape
 
         # train in srgb color space
-        if C == 4:
-            # train with random background color if using alpha mixing
-            #bg_color = torch.ones(3, device=self.device) # [3], fixed white background
-            #bg_color = torch.rand(3, device=self.device) # [3], frame-wise random.
-            bg_color = torch.rand_like(
-                images[..., :3])  # [N, 3], pixel-wise random.
-            gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (
-                1 - images[..., 3:])
-        else:
-            bg_color = None
-            gt_rgb = images
+        bg_color = None
+        # gt_rgb = images
 
         outputs = self.model.render(z,
                                     rays_o,
@@ -409,14 +484,14 @@ class Trainer(object):
                                     perturb=True,
                                     **vars(self.opt))
 
-        pred_rgb = outputs['image']
+        # pred_rgb = outputs['image']
 
-        loss = self.criterion(pred_rgb,
-                              gt_rgb).mean(-1)  # [B, N, 3] --> [B, N]
+        # loss = self.criterion(pred_rgb,
+        #                       gt_rgb).mean(-1)  # [B, N, 3] --> [B, N]
 
-        loss = loss.mean()
+        # loss = loss.mean()
 
-        return pred_rgb, gt_rgb, loss
+        return outputs
 
     def eval_step(self, data):
 
@@ -448,7 +523,7 @@ class Trainer(object):
         return pred_rgb, pred_depth, gt_rgb, loss
 
     # moved out bg_color and perturb for more flexible control...
-    def test_step(self, data, bg_color=None, perturb=False):
+    def test_step(self, data, z, bg_color=None, perturb=False):
 
         rays_o = data['rays_o']  # [B, N, 3]
         rays_d = data['rays_d']  # [B, N, 3]
@@ -457,7 +532,8 @@ class Trainer(object):
         if bg_color is not None:
             bg_color = bg_color.to(self.device)
 
-        outputs = self.model.render(rays_o,
+        outputs = self.model.render(z,
+                                    rays_o,
                                     rays_d,
                                     staged=True,
                                     bg_color=bg_color,
@@ -506,9 +582,9 @@ class Trainer(object):
                 os.path.join(self.workspace, "run", self.name))
 
         # mark untrained region (i.e., not covered by any camera from the training dataset)
-        if self.model.cuda_ray:
-            self.model.mark_untrained_grid(train_loader._data.poses,
-                                           train_loader._data.intrinsics)
+        # if self.model.cuda_ray:
+        #     self.model.mark_untrained_grid(train_loader._data.poses,
+        #                                    train_loader._data.intrinsics)
 
         for epoch in range(self.epoch, max_epochs + 1):
             self.epoch = epoch
@@ -554,8 +630,9 @@ class Trainer(object):
 
             for i, data in enumerate(loader):
 
+                z = torch.rand((1, 32))
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth = self.test_step(data)
+                    preds, preds_depth = self.test_step(data, z)
 
                 path = os.path.join(save_path, f'{i:04d}.png')
                 path_depth = os.path.join(save_path, f'{i:04d}_depth.png')
@@ -635,9 +712,7 @@ class Trainer(object):
         return outputs
 
     def train_one_epoch(self, loader):
-        self.log(
-            f"==> Start Training Epoch {self.epoch}, lr={self.optimizer.param_groups[0]['lr']:.6f} ..."
-        )
+        self.log(f"==> Start Training Epoch {self.epoch} ...")
 
         total_loss = 0
         if self.local_rank == 0 and self.report_metric_at_train:
@@ -665,12 +740,13 @@ class Trainer(object):
 
         self.local_step = 0
 
-        for data in loader:
+        for it, data in enumerate(loader):
 
             self.local_step += 1
             self.global_step += 1
 
-            self.optimizer.zero_grad()
+            self.d_optimizer.zero_grad()
+            self.g_optimizer.zero_grad()
 
             z = torch.rand((1, 32))
 
@@ -678,17 +754,29 @@ class Trainer(object):
                 self.model.update_extra_state(z)
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data, z)
+                outputs = self.train_step(data, z)
 
-            self.scaler.scale(loss).backward()
+            d_loss_real = self.discriminator(data['images'], data['poses'])
+            d_loss_fake = self.discriminator(outputs['image'],
+                                             data['sampled_poses'])
+            gradient_penalty = self.calculate_gradient_penalty(
+                data['images'].data, outputs['image'].data)
+            d_loss = (d_loss_fake - d_loss_real).mean() + gradient_penalty
+            print(d_loss)
+
+            self.scaler.scale(d_loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            raise
 
-            if self.scheduler_update_every_step:
-                self.lr_scheduler.step()
+            # if self.scheduler_update_every_step:
+            #     self.lr_scheduler.step()
 
-            loss_val = loss.item()
-            total_loss += loss_val
+            d_loss_val = d_loss.item()
+            total_loss += d_loss_val
+
+            if it % self.critic_iter == 0:
+                pass
 
             if self.local_rank == 0:
                 if self.report_metric_at_train:
@@ -696,20 +784,20 @@ class Trainer(object):
                         metric.update(preds, truths)
 
                 if self.use_tensorboardX:
-                    self.writer.add_scalar("train/loss", loss_val,
+                    self.writer.add_scalar("train/d_loss", d_loss_val,
                                            self.global_step)
-                    self.writer.add_scalar(
-                        "train/lr", self.optimizer.param_groups[0]['lr'],
-                        self.global_step)
+                    # self.writer.add_scalar(
+                    #     "train/lr", self.optimizer.param_groups[0]['lr'],
+                    #     self.global_step)
 
-                if self.scheduler_update_every_step:
-                    pbar.set_description(
-                        f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}"
-                    )
-                else:
-                    pbar.set_description(
-                        f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})"
-                    )
+                # if self.scheduler_update_every_step:
+                #     pbar.set_description(
+                #         f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}"
+                #     )
+                # else:
+                pbar.set_description(
+                    f"loss={d_loss_val:.4f} ({total_loss/self.local_step:.4f})"
+                )
                 pbar.update(loader.batch_size)
 
         if self.ema is not None:

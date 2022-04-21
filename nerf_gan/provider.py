@@ -11,7 +11,7 @@ import trimesh
 import torch
 from torch.utils.data import DataLoader
 
-from .utils import get_rays
+from .utils import get_rays, get_rays_from_grids
 
 
 # ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
@@ -110,6 +110,7 @@ class NeRFDataset:
         self.mode = opt.mode  # colmap, blender, llff
         self.scale = opt.scale  # camera radius scale to make sure camera are inside the bounding box.
         self.bound = opt.bound  # bounding box half length, also used as the radius to random sample poses.
+        self.grid_size = 32
 
         self.training = self.type in ['train', 'all']
         self.num_rays = self.opt.num_rays if self.training else -1
@@ -150,6 +151,7 @@ class NeRFDataset:
                 transform = {'h': 256, 'w': 256}
             else:
                 transform = {'h': 64, 'w': 64}
+            transform['frames'] = []
 
             # Load intrinsics
             transform_path = transform_paths[0]
@@ -161,7 +163,7 @@ class NeRFDataset:
             transform['cy'] = transform['h'] // 2
 
             total_num_imgs = 0
-            for transform_path in transform_paths[:10]:
+            for transform_path in transform_paths[:100]:
                 poses = np.load(transform_path)
                 num_imgs = len(poses.files) // 4
                 self.partition_ids.append(
@@ -218,7 +220,8 @@ class NeRFDataset:
         # visualize_poses(self.poses.numpy())
 
         # [debug] uncomment to view examples of randomly generated poses.
-        # visualize_poses(rand_poses(100, self.device, radius=self.radius).cpu().numpy())
+        # visualize_poses(
+        #     rand_poses(100, self.device, radius=self.radius).cpu().numpy())
 
         # load intrinsics
         if 'fl_x' in transform or 'fl_y' in transform:
@@ -283,14 +286,19 @@ class NeRFDataset:
 
         poses = poses.to(self.device)  # [B, 4, 4]
 
-        rays = get_rays(poses, self.intrinsics, self.H, self.W, 128)
+        sampled_poses = rand_poses(24, self.device, radius=self.radius)
+        sampled_rays = get_rays_from_grids(sampled_poses, self.intrinsics,
+                                           self.H, self.W, self.grid_size)
+        rays = get_rays_from_grids(poses, self.intrinsics, self.H, self.W,
+                                   self.grid_size)
 
         results = {
             'H': self.H,
             'W': self.W,
-            'rays_o': rays['rays_o'],
-            'rays_d': rays['rays_d'],
+            'rays_o': sampled_rays['rays_o'],
+            'rays_d': sampled_rays['rays_d'],
             'poses': poses,
+            'sampled_poses': sampled_poses,
         }
 
         images = self.images.to(self.device)  # [B, H, W, 3/4]

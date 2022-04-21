@@ -143,10 +143,9 @@ class NeRFDataset:
                                      f'transforms_{type}.json'), 'r') as f:
                     transform = json.load(f)
         elif self.mode == 'shapenet':
-            # obj_id = '03001627'  # chair
-            obj_id = '02691156'
+            obj_id = '03001627'  # chair
             transform_path = glob.glob(
-                os.path.join(self.root_path, obj_id, '**/cameras.npz'))[20]
+                os.path.join(self.root_path, obj_id, '**/cameras.npz'))[30]
 
             if 'ShapeNet' in self.root_path:
                 transform = {'h': 256, 'w': 256}

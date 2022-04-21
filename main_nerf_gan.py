@@ -2,6 +2,7 @@ import torch
 import argparse
 
 from nerf_gan.provider import NeRFDataset
+from nerf_gan.discriminator import Discriminator
 from nerf_gan.gui import NeRFGUI
 from nerf_gan.utils import (seed_everything, Trainer, PSNRMeter, optim)
 
@@ -152,7 +153,7 @@ if __name__ == '__main__':
         density_scale=10 if opt.mode == 'blender' else 1,
     )
 
-    print(model)
+    discriminator = Discriminator()
 
     criterion = torch.nn.MSELoss(reduction='none')
 
@@ -189,44 +190,53 @@ if __name__ == '__main__':
 
     else:
 
-        optimizer = lambda model: torch.optim.Adam([
-            {
-                'name': 'encoding',
-                'params': list(model.encoder.parameters())
-            },
-            {
-                'name':
-                'net',
-                'params':
-                list(model.sigma_net.parameters()) + list(model.color_net.
-                                                          parameters()),
-                'weight_decay':
-                1e-6
-            },
-        ],
-                                                   lr=opt.lr,
-                                                   betas=(0.9, 0.99),
-                                                   eps=1e-15)
+        def g_optimizer(model):
+            return torch.optim.Adam([
+                {
+                    'name': 'encoding',
+                    'params': list(model.encoder.parameters())
+                },
+                {
+                    'name':
+                    'net',
+                    'params':
+                    list(model.sigma_net.parameters()) +
+                    list(model.color_net.parameters()),
+                    'weight_decay':
+                    1e-6
+                },
+            ],
+                                    lr=opt.lr,
+                                    betas=(0.9, 0.99),
+                                    eps=1e-15)
+
+        def d_optimizer(model):
+            return torch.optim.Adam(model.parameters(),
+                                    lr=opt.lr,
+                                    betas=(0.9, 0.99))
 
         # need different milestones for GUI/CMD mode.
-        scheduler = lambda optimizer: optim.lr_scheduler.MultiStepLR(
-            optimizer,
-            milestones=[1000, 1500, 2000] if opt.gui else [100, 200],
-            gamma=0.33)
+        # scheduler = lambda optimizer: optim.lr_scheduler.MultiStepLR(
+        #     optimizer,
+        #     milestones=[1000, 1500, 2000] if opt.gui else [100, 200],
+        #     gamma=0.33)
 
-        trainer = Trainer('ngp',
-                          opt,
-                          model,
-                          device=device,
-                          workspace=opt.workspace,
-                          optimizer=optimizer,
-                          criterion=criterion,
-                          ema_decay=0.95,
-                          fp16=opt.fp16,
-                          lr_scheduler=scheduler,
-                          metrics=[PSNRMeter()],
-                          use_checkpoint=opt.ckpt,
-                          eval_interval=50)
+        trainer = Trainer(
+            'ngp',
+            opt,
+            model,
+            discriminator,
+            device=device,
+            workspace=opt.workspace,
+            g_optimizer=g_optimizer,
+            d_optimizer=d_optimizer,
+            # criterion=criterion,
+            ema_decay=0.95,
+            fp16=opt.fp16,
+            # lr_scheduler=scheduler,
+            metrics=[PSNRMeter()],
+            use_checkpoint=opt.ckpt,
+            eval_interval=50)
 
         if opt.gui:
             train_loader = NeRFDataset(opt, device=device,
