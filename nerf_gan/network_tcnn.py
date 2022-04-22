@@ -17,7 +17,7 @@ class NeRFNetwork(NeRFRenderer):
                  num_layers=2,
                  hidden_dim=64,
                  geo_feat_dim=15,
-                 latent_dim=32,
+                 latent_dim=64,
                  num_layers_color=3,
                  hidden_dim_color=64,
                  bound=1,

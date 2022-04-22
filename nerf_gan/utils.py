@@ -1,30 +1,34 @@
 import os
 import glob
 import tqdm
-import math
 import random
-import warnings
 import tensorboardX
 
 import numpy as np
-import pandas as pd
 
 import time
-from datetime import datetime
 
 import cv2
 import matplotlib.pyplot as plt
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.utils.data import Dataset, DataLoader
 from torch import autograd
 
 import trimesh
 import mcubes
+from pytorch3d.io import load_objs_as_meshes
+from pytorch3d.renderer import (
+    look_at_view_transform,
+    MeshRenderer,
+    MeshRasterizer,
+    PerspectiveCameras,
+    RasterizationSettings,
+    BlendParams,
+    SoftPhongShader,
+)
 from rich.console import Console
 from torch_ema import ExponentialMovingAverage
 
@@ -437,29 +441,39 @@ class Trainer(object):
 
     ### ------------------------------
 
-    def calculate_gradient_penalty(self, real_images, fake_images):
+    def calculate_gradient_penalty(self, real_images, fake_images, real_poses,
+                                   fake_poses):
         B = real_images.shape[0]
-        eta = torch.FloatTensor(B, 1, 1, 1).uniform_(0, 1)
-        eta = eta.expand(B, real_images.size(1), real_images.size(2),
-                         real_images.size(3))
-        eta = eta.cuda()
+        eta = torch.FloatTensor(B).uniform_(0, 1)
+        eta_images = eta.reshape(B, 1, 1).expand(B, real_images.size(1),
+                                                 real_images.size(2))
+        eta_images = eta_images.cuda()
+        interpolated_images = eta_images * real_images + (
+            (1 - eta_images) * fake_images)
+        interpolated_images = interpolated_images.cuda()
 
-        interpolated = eta * real_images + ((1 - eta) * fake_images)
-        interpolated = interpolated.cuda()
+        eta_poses = eta.reshape(B, 1, 1).expand(B, real_poses.size(1),
+                                                real_poses.size(2))
+        eta_poses = eta_poses.cuda()
+        interpolated_poses = eta_poses * real_poses + (
+            (1 - eta_poses) * fake_poses)
+        interpolated_poses = interpolated_poses.cuda()
 
         # define it to calculate gradient
-        interpolated.requires_grad_()
+        interpolated_images.requires_grad_()
+        interpolated_poses.requires_grad_()
 
         # calculate probability of interpolated examples
-        prob_interpolated = self.discriminator(interpolated)
+        prob_interpolated = self.discriminator(interpolated_images,
+                                               interpolated_poses)
 
         # calculate gradients of probabilities with respect to examples
-        gradients = autograd.grad(outputs=prob_interpolated,
-                                  inputs=interpolated,
-                                  grad_outputs=torch.ones(
-                                      prob_interpolated.size()).cuda(),
-                                  create_graph=True,
-                                  retain_graph=True)[0]
+        gradients = autograd.grad(
+            outputs=prob_interpolated,
+            inputs=[interpolated_images, interpolated_poses],
+            grad_outputs=torch.ones(prob_interpolated.size()).cuda(),
+            create_graph=True,
+            retain_graph=True)[0]
 
         grad_penalty = ((gradients.norm(2, dim=1) - 1)**2).mean() * 10.0
         return grad_penalty
@@ -468,9 +482,9 @@ class Trainer(object):
 
         rays_o = data['rays_o']  # [B, N, 3]
         rays_d = data['rays_d']  # [B, N, 3]
-        images = data['images']  # [B, N, 3/4]
+        # images = data['images']  # [B, N, 3/4]
 
-        B, N, C = images.shape
+        # B, N, C = images.shape
 
         # train in srgb color space
         bg_color = None
@@ -740,15 +754,43 @@ class Trainer(object):
 
         self.local_step = 0
 
+        blend_params = BlendParams(background_color=[0, 0, 0])
+        raster_settings = RasterizationSettings(
+            image_size=256,
+            blur_radius=0.0,
+        )
+        renderer = MeshRenderer(
+            rasterizer=MeshRasterizer(raster_settings=raster_settings),
+            shader=SoftPhongShader(blend_params=blend_params,
+                                   device=self.device))
+
         for it, data in enumerate(loader):
+            mesh = load_objs_as_meshes([data['obj_path']], device=self.device)
+            mesh = mesh.extend(data['poses'].shape[0])
+            poses = data['poses']
+            with torch.inference_mode():
+                cameras = PerspectiveCameras(
+                    focal_length=(data['fx'] + data['fy']) / 2,
+                    principal_point=((0.0, 0.0), ),
+                    R=poses[:, :3, :3].transpose(1, 2),
+                    T=-torch.bmm(poses[:, :3, :3].transpose(1, 2),
+                                 poses[:, :3, 3:4])[:, :, 0],
+                    device=self.device)
+                images = renderer(mesh, cameras=cameras)[..., :3]
+                data['images'] = images
+                # for i in range(10):
+                #     plt.figure(figsize=(10, 10))
+                #     plt.imshow(images[i, ..., :3].cpu().numpy())
+                #     plt.axis("off")
+                #     plt.show()
+                # continue
 
             self.local_step += 1
             self.global_step += 1
 
             self.d_optimizer.zero_grad()
-            self.g_optimizer.zero_grad()
 
-            z = torch.rand((1, 32))
+            z = torch.rand((1, 64))
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 self.model.update_extra_state(z)
@@ -760,14 +802,13 @@ class Trainer(object):
             d_loss_fake = self.discriminator(outputs['image'],
                                              data['sampled_poses'])
             gradient_penalty = self.calculate_gradient_penalty(
-                data['images'].data, outputs['image'].data)
-            d_loss = (d_loss_fake - d_loss_real).mean() + gradient_penalty
-            print(d_loss)
+                data['images'], outputs['image'].data, data['poses'],
+                data['sampled_poses'])
+            d_loss = (d_loss_real - d_loss_fake).mean() + gradient_penalty
 
             self.scaler.scale(d_loss).backward()
-            self.scaler.step(self.optimizer)
+            self.scaler.step(self.d_optimizer)
             self.scaler.update()
-            raise
 
             # if self.scheduler_update_every_step:
             #     self.lr_scheduler.step()
@@ -775,13 +816,21 @@ class Trainer(object):
             d_loss_val = d_loss.item()
             total_loss += d_loss_val
 
-            if it % self.critic_iter == 0:
-                pass
+            if (it % self.critic_iter + 1) == 0:
+                self.g_optimizer.zero_grad()
+                z = torch.rand((1, 64))
+                with torch.cuda.amp.autocast(enabled=self.fp16):
+                    outputs = self.train_step(data, z)
+                g_loss = self.discriminator(outputs['image'],
+                                            data['sampled_poses'])
+                self.scaler.scale(g_loss).backward()
+                self.scaler.step(self.g_optimizer)
+                self.scaler.update()
 
             if self.local_rank == 0:
-                if self.report_metric_at_train:
-                    for metric in self.metrics:
-                        metric.update(preds, truths)
+                # if self.report_metric_at_train:
+                # for metric in self.metrics:
+                #     metric.update(preds, truths)
 
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/d_loss", d_loss_val,
@@ -815,12 +864,12 @@ class Trainer(object):
                         metric.write(self.writer, self.epoch, prefix="train")
                     metric.clear()
 
-        if not self.scheduler_update_every_step:
-            if isinstance(self.lr_scheduler,
-                          torch.optim.lr_scheduler.ReduceLROnPlateau):
-                self.lr_scheduler.step(average_loss)
-            else:
-                self.lr_scheduler.step()
+        # if not self.scheduler_update_every_step:
+        #     if isinstance(self.lr_scheduler,
+        #                   torch.optim.lr_scheduler.ReduceLROnPlateau):
+        #         self.lr_scheduler.step(average_loss)
+        #     else:
+        #         self.lr_scheduler.step()
 
         self.log(f"==> Finished Epoch {self.epoch}.")
 
