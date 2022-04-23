@@ -298,30 +298,31 @@ class PSNRMeter:
 class Trainer(object):
 
     def __init__(
-        self,
-        name,  # name of this experiment
-        opt,  # extra conf
-        model,  # network 
-        discriminator=None,  # discriminator
-        d_optimizer=None,  # optimizer
-        g_optimizer=None,  # optimizer
-        latent_dim=128,  # z latent feature
-        ema_decay=None,  # if use EMA, set the decay
-        metrics=[],  # metrics for evaluation, if None, use val_loss to measure performance, else use the first metric.
-        local_rank=0,  # which GPU am I
-        world_size=1,  # total num of GPUs
-        device=None,  # device to use, usually setting to None is OK. (auto choose device)
-        mute=False,  # whether to mute all print
-        fp16=False,  # amp optimize level
-        eval_interval=1,  # eval once every $ epoch
-        max_keep_ckpt=2,  # max num of saved ckpts in disk
-        workspace='workspace',  # workspace to save logs & ckpts
-        best_mode='min',  # the smaller/larger result, the better
-        use_loss_as_metric=True,  # use loss as the first metric
-        report_metric_at_train=False,  # also report metrics at training
-        use_checkpoint="latest",  # which ckpt to use at init time
-        use_tensorboardX=True,  # whether to use tensorboard for logging
-        # scheduler_update_every_step=False,  # whether to call scheduler.step() after every train step
+            self,
+            name,  # name of this experiment
+            opt,  # extra conf
+            model,  # network
+            discriminator=None,  # discriminator
+            d_optimizer=None,  # optimizer
+            g_optimizer=None,  # optimizer
+            latent_dim=128,  # z latent feature
+            ema_decay=None,  # if use EMA, set the decay
+            lr_scheduler=None,  # scheduler
+            metrics=[],  # metrics for evaluation, if None, use val_loss to measure performance, else use the first metric.
+            local_rank=0,  # which GPU am I
+            world_size=1,  # total num of GPUs
+            device=None,  # device to use, usually setting to None is OK. (auto choose device)
+            mute=False,  # whether to mute all print
+            fp16=False,  # amp optimize level
+            eval_interval=1,  # eval once every $ epoch
+            max_keep_ckpt=2,  # max num of saved ckpts in disk
+            workspace='workspace',  # workspace to save logs & ckpts
+            best_mode='min',  # the smaller/larger result, the better
+            use_loss_as_metric=True,  # use loss as the first metric
+            report_metric_at_train=False,  # also report metrics at training
+            use_checkpoint="latest",  # which ckpt to use at init time
+            use_tensorboardX=True,  # whether to use tensorboard for logging
+            scheduler_update_every_step=False,  # whether to call scheduler.step() after every train step
     ):
 
         self.name = name
@@ -342,7 +343,7 @@ class Trainer(object):
         self.use_tensorboardX = use_tensorboardX
         self.latent_dim = latent_dim
         self.time_stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-        # self.scheduler_update_every_step = scheduler_update_every_step
+        self.scheduler_update_every_step = scheduler_update_every_step
         self.device = device if device is not None else torch.device(
             f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
         self.console = Console()
@@ -369,11 +370,8 @@ class Trainer(object):
         if d_optimizer is not None and self.discriminator is not None:
             self.d_optimizer = d_optimizer(self.discriminator)
 
-        # if lr_scheduler is None:
-        #     self.lr_scheduler = optim.lr_scheduler.LambdaLR(
-        #         self.optimizer, lr_lambda=lambda epoch: 1)  # fake scheduler
-        # else:
-        #     self.lr_scheduler = lr_scheduler(self.optimizer)
+        self.g_lr_scheduler = lr_scheduler(self.g_optimizer)
+        self.d_lr_scheduler = lr_scheduler(self.d_optimizer)
 
         if ema_decay is not None:
             self.ema = ExponentialMovingAverage(self.model.parameters(),
@@ -624,7 +622,6 @@ class Trainer(object):
         for epoch in range(self.epoch, max_epochs + 1):
             self.epoch = epoch
 
-            self.save_checkpoint(full=True)
             self.train_one_epoch(train_loader)
 
             if self.workspace is not None and self.local_rank == 0:
@@ -791,19 +788,16 @@ class Trainer(object):
                                  poses[:, :3, 3:4])[:, :, 0],
                     device=self.device)
                 images = renderer(mesh, cameras=cameras)[..., :3]
-
                 B = images.shape[0]
                 C = images.shape[-1]
                 images = torch.gather(images.view(B, -1, C), 1,
                                       torch.stack(C * [data['rays_inds']],
                                                   -1))  # [B, N, 3/4]
-
                 # img = images[0].reshape(32, 32, 3)
                 # plt.figure(figsize=(10, 10))
                 # plt.imshow(img.cpu().numpy())
                 # plt.axis("off")
                 # plt.show()
-
                 data['images'] = images
 
             self.local_step += 1
@@ -812,8 +806,6 @@ class Trainer(object):
             self.d_optimizer.zero_grad()
 
             z = torch.rand((1, self.latent_dim))
-            # with torch.cuda.amp.autocast(enabled=self.fp16):
-            #     self.model.update_extra_state(z)
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 outputs = self.train_step(data, z)
@@ -830,9 +822,6 @@ class Trainer(object):
             self.scaler.scale(gradient_penalty).backward()
             self.scaler.step(self.d_optimizer)
             self.scaler.update()
-
-            # if self.scheduler_update_every_step:
-            #     self.lr_scheduler.step()
 
             d_loss_val = d_loss.item()
             total_loss += d_loss_val
@@ -861,20 +850,16 @@ class Trainer(object):
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/d_loss", d_loss_val,
                                            self.global_step)
-
+                    self.writer.add_scalar(
+                        "train/d_lr", self.d_optimizer.param_groups[0]['lr'],
+                        self.global_step)
+                    self.writer.add_scalar(
+                        "train/g_lr", self.g_optimizer.param_groups[0]['lr'],
+                        self.global_step)
                     if (it % self.critic_iter + 1) == 0:
                         self.writer.add_scalar("train/g_loss", g_loss_val,
                                                self.global_step)
 
-                    # self.writer.add_scalar(
-                    #     "train/lr", self.optimizer.param_groups[0]['lr'],
-                    #     self.global_step)
-
-                # if self.scheduler_update_every_step:
-                #     pbar.set_description(
-                #         f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}"
-                #     )
-                # else:
                 pbar.set_description(
                     f"d_loss={d_loss_val:.4f} g_loss={g_loss_val:.4f} ({total_loss/self.local_step:.4f})"
                 )
@@ -895,13 +880,8 @@ class Trainer(object):
                         metric.write(self.writer, self.epoch, prefix="train")
                     metric.clear()
 
-        # if not self.scheduler_update_every_step:
-        #     if isinstance(self.lr_scheduler,
-        #                   torch.optim.lr_scheduler.ReduceLROnPlateau):
-        #         self.lr_scheduler.step(average_loss)
-        #     else:
-        #         self.lr_scheduler.step()
-
+        self.g_lr_scheduler.step()
+        self.d_lr_scheduler.step()
         self.log(f"==> Finished Epoch {self.epoch}.")
 
     def evaluate_one_epoch(self, loader):

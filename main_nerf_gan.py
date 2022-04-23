@@ -206,37 +206,34 @@ if __name__ == '__main__':
                     1e-6
                 },
             ],
-                                    lr=opt.lr,
+                                    lr=5e-4,
                                     betas=(0.9, 0.99),
                                     eps=1e-15)
 
         def d_optimizer(model):
             return torch.optim.Adam(model.parameters(),
-                                    lr=opt.lr,
+                                    lr=1e-4,
                                     betas=(0.9, 0.99))
 
         # need different milestones for GUI/CMD mode.
-        # scheduler = lambda optimizer: optim.lr_scheduler.MultiStepLR(
-        #     optimizer,
-        #     milestones=[1000, 1500, 2000] if opt.gui else [100, 200],
-        #     gamma=0.33)
+        def scheduler(optimizer):
+            return optim.lr_scheduler.MultiStepLR(
+                optimizer, milestones=[50000, 100000, 200000], gamma=0.5)
 
-        trainer = Trainer(
-            'ngp',
-            opt,
-            model,
-            discriminator,
-            device=device,
-            workspace=opt.workspace,
-            g_optimizer=g_optimizer,
-            d_optimizer=d_optimizer,
-            # criterion=criterion,
-            ema_decay=0.95,
-            fp16=opt.fp16,
-            # lr_scheduler=scheduler,
-            metrics=[PSNRMeter()],
-            use_checkpoint=opt.ckpt,
-            eval_interval=50)
+        trainer = Trainer('ngp',
+                          opt,
+                          model,
+                          discriminator,
+                          device=device,
+                          workspace=opt.workspace,
+                          g_optimizer=g_optimizer,
+                          d_optimizer=d_optimizer,
+                          ema_decay=0.95,
+                          fp16=opt.fp16,
+                          lr_scheduler=scheduler,
+                          metrics=[PSNRMeter()],
+                          use_checkpoint=opt.ckpt,
+                          eval_interval=50)
 
         if opt.gui:
             train_loader = NeRFDataset(opt, device=device,
