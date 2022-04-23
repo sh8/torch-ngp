@@ -118,6 +118,7 @@ class NeRFRenderer(nn.Module):
         self.local_step = 0
 
     def run(self,
+            z,
             rays_o,
             rays_d,
             num_steps=128,
@@ -128,6 +129,8 @@ class NeRFRenderer(nn.Module):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # bg_color: [3] in range [0, 1]
         # return: image: [B, N, 3], depth: [B, N]
+        z_shape = z[:, :64]
+        z_appearance = z[:, 64:]
 
         prefix = rays_o.shape[:-1]
         rays_o = rays_o.contiguous().view(-1, 3)
@@ -165,8 +168,11 @@ class NeRFRenderer(nn.Module):
 
         #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
 
+        xyzs_reshape = xyzs.reshape(-1, 3)  # This is ugly...
+        z_shape = z_shape.repeat(xyzs_reshape.shape[0], 1)
+        z_shape = z_shape.to(device)
         # query SDF and RGB
-        density_outputs = self.density(xyzs.reshape(-1, 3))
+        density_outputs = self.density(xyzs_reshape, z_shape)
 
         #sigmas = density_outputs['sigma'].view(N, num_steps) # [N, T]
         for k, v in density_outputs.items():
@@ -206,8 +212,7 @@ class NeRFRenderer(nn.Module):
                                      aabb[3:])  # a manual clip.
 
             # only forward new points to save computation
-            new_density_outputs = self.density(new_xyzs.reshape(-1, 3))
-            #new_sigmas = new_density_outputs['sigma'].view(N, upsample_steps) # [N, t]
+            new_density_outputs = self.density(new_xyzs.reshape(-1, 3), z)
             for k, v in new_density_outputs.items():
                 new_density_outputs[k] = v.view(N, upsample_steps, -1)
 
@@ -246,8 +251,11 @@ class NeRFRenderer(nn.Module):
         for k, v in density_outputs.items():
             density_outputs[k] = v.view(-1, v.shape[-1])
 
+        z_appearance = z_appearance.repeat(xyzs_reshape.shape[0], 1)
+        z_appearance = z_shape.to(device)
         rgbs = self.color(xyzs.reshape(-1, 3),
                           dirs.reshape(-1, 3),
+                          z_appearance,
                           mask=mask.reshape(-1),
                           **density_outputs)
         rgbs = rgbs.view(N, -1, 3)  # [N, T+t, 3]

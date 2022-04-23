@@ -17,7 +17,7 @@ class NeRFNetwork(NeRFRenderer):
                  num_layers=2,
                  hidden_dim=64,
                  geo_feat_dim=15,
-                 latent_dim=64,
+                 latent_dim=128,
                  num_layers_color=3,
                  hidden_dim_color=64,
                  bound=1,
@@ -45,7 +45,7 @@ class NeRFNetwork(NeRFRenderer):
         )
 
         self.sigma_net = tcnn.Network(
-            n_input_dims=32 + self.latent_dim,
+            n_input_dims=32 + self.latent_dim // 2,
             n_output_dims=1 + self.geo_feat_dim,
             network_config={
                 "otype": "FullyFusedMLP",
@@ -68,7 +68,8 @@ class NeRFNetwork(NeRFRenderer):
             },
         )
 
-        self.in_dim_color = self.encoder_dir.n_output_dims + self.geo_feat_dim
+        self.in_dim_color = self.encoder_dir.n_output_dims + \
+            self.geo_feat_dim + self.latent_dim // 2
 
         self.color_net = tcnn.Network(
             n_input_dims=self.in_dim_color,
@@ -126,7 +127,7 @@ class NeRFNetwork(NeRFRenderer):
         }
 
     # allow masked inference
-    def color(self, x, d, mask=None, geo_feat=None, **kwargs):
+    def color(self, x, d, z, mask=None, geo_feat=None, **kwargs):
         # x: [N, 3] in [-bound, bound]
         # mask: [N,], bool, indicates where we actually needs to compute rgb.
 
@@ -143,12 +144,13 @@ class NeRFNetwork(NeRFRenderer):
             x = x[mask]
             d = d[mask]
             geo_feat = geo_feat[mask]
+            z = z[mask]
 
         # color
         d = (d + 1) / 2  # tcnn SH encoding requires inputs to be in [0, 1]
         d = self.encoder_dir(d)
 
-        h = torch.cat([d, geo_feat], dim=-1)
+        h = torch.cat([d, geo_feat, z], dim=-1)
         h = self.color_net(h)
 
         # sigmoid activation for rgb

@@ -6,6 +6,8 @@ import trimesh
 
 import torch
 from torch.utils.data import DataLoader
+from pytorch3d.io import load_obj, load_objs_as_meshes
+from pytorch3d.renderer import TexturesVertex
 
 from .utils import get_rays_from_grids
 
@@ -105,7 +107,7 @@ class NeRFDataset:
         self.root_path = opt.path
         self.mode = opt.mode  # colmap, blender, llff
 
-        self.num_of_views = 5
+        self.num_of_views = 2
         self.radius = 1.0
         self.H = 256
         self.W = 256
@@ -121,17 +123,30 @@ class NeRFDataset:
         self.intrinsics = np.array([
             self.fx * self.W / 2, self.fx * self.H / 2, self.W / 2, self.H // 2
         ])
+        self.iterations = 0
 
     def collate(self, index):
-        poses = rand_poses(self.num_of_views, self.device, radius=self.radius)
-        rays = get_rays_from_grids(poses, self.intrinsics, self.H, self.W,
-                                   self.grid_size)
+        fake_poses = rand_poses(self.num_of_views,
+                                self.device,
+                                radius=self.radius)
+        real_poses = rand_poses(self.num_of_views,
+                                self.device,
+                                radius=self.radius)
+        rays = get_rays_from_grids(real_poses, self.intrinsics, self.H, self.W,
+                                   self.grid_size, self.iterations)
         # visualize_poses(poses.cpu().numpy(), size=0.1)
 
         obj_path = self.obj_paths[index[0]]
-        # print(vertices.shape)
-        # colors, _ = load_mtl(obj_path.replace("obj", "mtl"))
-        # print(colors)
+
+        mesh = load_objs_as_meshes([obj_path],
+                                   load_textures=True,
+                                   create_texture_atlas=False,
+                                   device=self.device)
+        if mesh.textures is None:
+            mesh.textures = TexturesVertex(
+                torch.ones_like(mesh.verts_padded(), device=self.device))
+
+        self.iterations += 1
         results = {
             'H': self.H,
             'W': self.W,
@@ -139,8 +154,10 @@ class NeRFDataset:
             'fy': self.fy,
             'rays_o': rays['rays_o'],
             'rays_d': rays['rays_d'],
-            'obj_path': obj_path,
-            'poses': poses,
+            'rays_inds': rays['inds'],
+            'mesh': mesh,
+            'real_poses': real_poses,
+            'fake_poses': fake_poses,
         }
         return results
 

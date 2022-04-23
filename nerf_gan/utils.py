@@ -1,5 +1,6 @@
 import os
 import glob
+import math
 import tqdm
 import random
 import tensorboardX
@@ -19,14 +20,13 @@ from torch import autograd
 
 import trimesh
 import mcubes
-from pytorch3d.io import load_objs_as_meshes
 from pytorch3d.renderer import (
-    look_at_view_transform,
     MeshRenderer,
     MeshRasterizer,
     PerspectiveCameras,
     RasterizationSettings,
     BlendParams,
+    PointLights,
     SoftPhongShader,
 )
 from rich.console import Console
@@ -98,7 +98,15 @@ def get_rays(poses, intrinsics, H, W, N=-1):
 
 
 @torch.cuda.amp.autocast(enabled=False)
-def get_rays_from_grids(poses, intrinsics, H, W, grid_size):
+def get_rays_from_grids(poses,
+                        intrinsics,
+                        H,
+                        W,
+                        grid_size,
+                        iterations,
+                        scale_anneal=0.0025,
+                        min_scale=0.25,
+                        max_scale=1.0):
     ''' get rays
     Args:
         poses: [B, 4, 4], cam2world
@@ -109,34 +117,45 @@ def get_rays_from_grids(poses, intrinsics, H, W, grid_size):
         inds: [B, N]
     '''
     B = poses.shape[0]
-    grid_x = torch.randint(0, W // grid_size, size=[1])[0] * grid_size
-    grid_y = torch.randint(0, H // grid_size, size=[1])[0] * grid_size
+    # grid_x = torch.randint(0, W // grid_size, size=[1])[0] * grid_size
+    # grid_y = torch.randint(0, H // grid_size, size=[1])[0] * grid_size
 
     device = poses.device
-    B = poses.shape[0]
+    # B = poses.shape[0]
     fx, fy, cx, cy = intrinsics
 
-    i, j = custom_meshgrid(torch.linspace(0, W - 1, W, device=device),
-                           torch.linspace(0, H - 1, H, device=device))
-    i = i.t().reshape([1, H * W]).expand([B, H * W]) + 0.5
-    j = j.t().reshape([1, H * W]).expand([B, H * W]) + 0.5
+    if scale_anneal > 0:
+        k_iter = iterations // 1000 * 3
+        min_scale = max(min_scale,
+                        max_scale * math.exp(-k_iter * scale_anneal))
+        min_scale = min(0.9, min_scale)
+    else:
+        min_scale = min_scale
+
+    i, j = torch.meshgrid(torch.linspace(0, H - 1, grid_size, device=device),
+                          torch.linspace(0, W - 1, grid_size, device=device))
+
+    scale = torch.Tensor(1).uniform_(min_scale, max_scale)
+    i = i * scale.to(device)
+    j = j * scale.to(device)
+
+    max_offset = 1 - scale.item()
+    h_offset = torch.Tensor(1).uniform_(0, max_offset * H)
+    w_offset = torch.Tensor(1).uniform_(0, max_offset * W)
+    i = i + h_offset.to(device)
+    j = j + w_offset.to(device)
+
+    # implement Grid
+    i = i.reshape([1, -1]).repeat([B, 1]).long()
+    j = j.reshape([1, -1]).repeat([B, 1]).long()
+    inds = j + i * W
 
     results = {}
-
-    inds_y, inds_x = torch.meshgrid(torch.arange(grid_size, device=device),
-                                    torch.arange(grid_size, device=device),
-                                    indexing='ij')
-    inds = (grid_x + inds_x) + (grid_y + inds_y) * W
-    inds = inds.reshape(-1).expand([B, grid_size * grid_size])
-
-    i = torch.gather(i, -1, inds)
-    j = torch.gather(j, -1, inds)
-
     results['inds'] = inds
 
     zs = torch.ones_like(i)
-    xs = (i - cx) / fx * zs
-    ys = (j - cy) / fy * zs
+    ys = (i - cy) / fy * zs
+    xs = (j - cx) / fx * zs
     directions = torch.stack((xs, ys, zs), dim=-1)
     directions = directions / torch.norm(directions, dim=-1, keepdim=True)
     rays_d = directions @ poses[:, :3, :3].transpose(-1, -2)  # (B, N, 3)
@@ -286,6 +305,7 @@ class Trainer(object):
         discriminator=None,  # discriminator
         d_optimizer=None,  # optimizer
         g_optimizer=None,  # optimizer
+        latent_dim=128,  # z latent feature
         ema_decay=None,  # if use EMA, set the decay
         metrics=[],  # metrics for evaluation, if None, use val_loss to measure performance, else use the first metric.
         local_rank=0,  # which GPU am I
@@ -320,6 +340,7 @@ class Trainer(object):
         self.eval_interval = eval_interval
         self.use_checkpoint = use_checkpoint
         self.use_tensorboardX = use_tensorboardX
+        self.latent_dim = latent_dim
         self.time_stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         # self.scheduler_update_every_step = scheduler_update_every_step
         self.device = device if device is not None else torch.device(
@@ -603,14 +624,15 @@ class Trainer(object):
         for epoch in range(self.epoch, max_epochs + 1):
             self.epoch = epoch
 
+            self.save_checkpoint(full=True)
             self.train_one_epoch(train_loader)
 
             if self.workspace is not None and self.local_rank == 0:
-                self.save_checkpoint(full=True, best=False)
+                self.save_checkpoint(full=True)
 
-            if self.epoch % self.eval_interval == 0:
-                self.evaluate_one_epoch(valid_loader)
-                self.save_checkpoint(full=False, best=True)
+            # if self.epoch % self.eval_interval == 0:
+            #     self.evaluate_one_epoch(valid_loader)
+            #     self.save_checkpoint(full=False, best=True)
 
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer.close()
@@ -735,16 +757,6 @@ class Trainer(object):
 
         self.model.train()
 
-        # update grid
-        # if self.model.cuda_ray:
-        #     with torch.cuda.amp.autocast(enabled=self.fp16):
-        #         self.model.update_extra_state()
-
-        # distributedSampler: must call set_epoch() to shuffle indices across multiple epochs
-        # ref: https://pytorch.org/docs/stable/data.html
-        if self.world_size > 1:
-            loader.sampler.set_epoch(self.epoch)
-
         if self.local_rank == 0:
             pbar = tqdm.tqdm(
                 total=len(loader) * loader.batch_size,
@@ -755,20 +767,22 @@ class Trainer(object):
         self.local_step = 0
 
         blend_params = BlendParams(background_color=[0, 0, 0])
+        lights = PointLights(device=self.device, location=[[0.0, 0.0, -3.0]])
         raster_settings = RasterizationSettings(
             image_size=256,
+            bin_size=0,
             blur_radius=0.0,
         )
         renderer = MeshRenderer(
             rasterizer=MeshRasterizer(raster_settings=raster_settings),
             shader=SoftPhongShader(blend_params=blend_params,
+                                   lights=lights,
                                    device=self.device))
 
         for it, data in enumerate(loader):
-            mesh = load_objs_as_meshes([data['obj_path']], device=self.device)
-            mesh = mesh.extend(data['poses'].shape[0])
-            poses = data['poses']
             with torch.inference_mode():
+                mesh = data['mesh'].extend(data['real_poses'].shape[0])
+                poses = data['real_poses']
                 cameras = PerspectiveCameras(
                     focal_length=(data['fx'] + data['fy']) / 2,
                     principal_point=((0.0, 0.0), ),
@@ -777,36 +791,43 @@ class Trainer(object):
                                  poses[:, :3, 3:4])[:, :, 0],
                     device=self.device)
                 images = renderer(mesh, cameras=cameras)[..., :3]
+
+                B = images.shape[0]
+                C = images.shape[-1]
+                images = torch.gather(images.view(B, -1, C), 1,
+                                      torch.stack(C * [data['rays_inds']],
+                                                  -1))  # [B, N, 3/4]
+
+                # img = images[0].reshape(32, 32, 3)
+                # plt.figure(figsize=(10, 10))
+                # plt.imshow(img.cpu().numpy())
+                # plt.axis("off")
+                # plt.show()
+
                 data['images'] = images
-                # for i in range(10):
-                #     plt.figure(figsize=(10, 10))
-                #     plt.imshow(images[i, ..., :3].cpu().numpy())
-                #     plt.axis("off")
-                #     plt.show()
-                # continue
 
             self.local_step += 1
             self.global_step += 1
 
             self.d_optimizer.zero_grad()
 
-            z = torch.rand((1, 64))
-
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                self.model.update_extra_state(z)
+            z = torch.rand((1, self.latent_dim))
+            # with torch.cuda.amp.autocast(enabled=self.fp16):
+            #     self.model.update_extra_state(z)
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 outputs = self.train_step(data, z)
-
-            d_loss_real = self.discriminator(data['images'], data['poses'])
-            d_loss_fake = self.discriminator(outputs['image'],
-                                             data['sampled_poses'])
-            gradient_penalty = self.calculate_gradient_penalty(
-                data['images'], outputs['image'].data, data['poses'],
-                data['sampled_poses'])
-            d_loss = (d_loss_real - d_loss_fake).mean() + gradient_penalty
-
-            self.scaler.scale(d_loss).backward()
+                d_loss_real = self.discriminator(data['images'],
+                                                 data['real_poses']).mean()
+                d_loss_fake = -self.discriminator(outputs['image'],
+                                                  data['fake_poses']).mean()
+                gradient_penalty = self.calculate_gradient_penalty(
+                    data['images'], outputs['image'].data, data['real_poses'],
+                    data['fake_poses'])
+            d_loss = d_loss_real + d_loss_fake + gradient_penalty
+            self.scaler.scale(d_loss_real).backward()
+            self.scaler.scale(d_loss_fake).backward()
+            self.scaler.scale(gradient_penalty).backward()
             self.scaler.step(self.d_optimizer)
             self.scaler.update()
 
@@ -816,16 +837,21 @@ class Trainer(object):
             d_loss_val = d_loss.item()
             total_loss += d_loss_val
 
-            if (it % self.critic_iter + 1) == 0:
+            if (it % self.critic_iter) == 0:
                 self.g_optimizer.zero_grad()
-                z = torch.rand((1, 64))
+                z = torch.rand((1, self.latent_dim))
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     outputs = self.train_step(data, z)
-                g_loss = self.discriminator(outputs['image'],
-                                            data['sampled_poses'])
+                    g_loss = self.discriminator(outputs['image'],
+                                                data['fake_poses'])
                 self.scaler.scale(g_loss).backward()
                 self.scaler.step(self.g_optimizer)
                 self.scaler.update()
+                g_loss_val = g_loss.item()
+            else:
+                g_loss_val = 0.0
+
+            total_loss += g_loss_val
 
             if self.local_rank == 0:
                 # if self.report_metric_at_train:
@@ -835,6 +861,11 @@ class Trainer(object):
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/d_loss", d_loss_val,
                                            self.global_step)
+
+                    if (it % self.critic_iter + 1) == 0:
+                        self.writer.add_scalar("train/g_loss", g_loss_val,
+                                               self.global_step)
+
                     # self.writer.add_scalar(
                     #     "train/lr", self.optimizer.param_groups[0]['lr'],
                     #     self.global_step)
@@ -845,7 +876,7 @@ class Trainer(object):
                 #     )
                 # else:
                 pbar.set_description(
-                    f"loss={d_loss_val:.4f} ({total_loss/self.local_step:.4f})"
+                    f"d_loss={d_loss_val:.4f} g_loss={g_loss_val:.4f} ({total_loss/self.local_step:.4f})"
                 )
                 pbar.update(loader.batch_size)
 
@@ -996,7 +1027,7 @@ class Trainer(object):
 
         self.log(f"++> Evaluate epoch {self.epoch} Finished.")
 
-    def save_checkpoint(self, full=False, best=False):
+    def save_checkpoint(self, full=False):
 
         state = {
             'epoch': self.epoch,
@@ -1008,51 +1039,26 @@ class Trainer(object):
             state['mean_density'] = self.model.mean_density
 
         if full:
-            state['optimizer'] = self.optimizer.state_dict()
-            state['lr_scheduler'] = self.lr_scheduler.state_dict()
+            state['d_optimizer'] = self.d_optimizer.state_dict()
+            state['g_optimizer'] = self.g_optimizer.state_dict()
             state['scaler'] = self.scaler.state_dict()
             if self.ema is not None:
                 state['ema'] = self.ema.state_dict()
 
-        if not best:
+        # if not best:
+        state['model'] = self.model.state_dict()
+        state['discriminator'] = self.discriminator.state_dict()
 
-            state['model'] = self.model.state_dict()
+        file_path = f"{self.ckpt_path}/{self.name}_ep{self.epoch:04d}.pth.tar"
 
-            file_path = f"{self.ckpt_path}/{self.name}_ep{self.epoch:04d}.pth.tar"
+        self.stats["checkpoints"].append(file_path)
 
-            self.stats["checkpoints"].append(file_path)
+        if len(self.stats["checkpoints"]) > self.max_keep_ckpt:
+            old_ckpt = self.stats["checkpoints"].pop(0)
+            if os.path.exists(old_ckpt):
+                os.remove(old_ckpt)
 
-            if len(self.stats["checkpoints"]) > self.max_keep_ckpt:
-                old_ckpt = self.stats["checkpoints"].pop(0)
-                if os.path.exists(old_ckpt):
-                    os.remove(old_ckpt)
-
-            torch.save(state, file_path)
-
-        else:
-            if len(self.stats["results"]) > 0:
-                if self.stats["best_result"] is None or self.stats["results"][
-                        -1] < self.stats["best_result"]:
-                    self.log(
-                        f"[INFO] New best result: {self.stats['best_result']} --> {self.stats['results'][-1]}"
-                    )
-                    self.stats["best_result"] = self.stats["results"][-1]
-
-                    # save ema results
-                    if self.ema is not None:
-                        self.ema.store()
-                        self.ema.copy_to()
-
-                    state['model'] = self.model.state_dict()
-
-                    if self.ema is not None:
-                        self.ema.restore()
-
-                    torch.save(state, self.best_path)
-            else:
-                self.log(
-                    f"[WARN] no evaluated results found, skip saving best checkpoint."
-                )
+        torch.save(state, file_path)
 
     def load_checkpoint(self, checkpoint=None, model_only=False):
         if checkpoint is None:

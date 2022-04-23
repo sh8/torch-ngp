@@ -10,7 +10,7 @@ class Discriminator(nn.Module):
     def __init__(self,
                  num_classes=1,
                  dim=1024,
-                 depth=6,
+                 depth=3,
                  heads=16,
                  patch_dim=3075,
                  mlp_dim=2048,
@@ -40,13 +40,9 @@ class Discriminator(nn.Module):
                       dim=2)
         x = self.to_patch_embedding(x)
         b, n, _ = x.shape
-
         cls_tokens = repeat(self.cls_token, '1 n d -> b n d', b=b)
         x = torch.cat((cls_tokens, x), dim=1)
         x = self.dropout(x)
-
         x = self.transformer(x)
-
         x = x.mean(dim=1)
-
         return self.mlp_head(x)
