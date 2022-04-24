@@ -101,13 +101,14 @@ class NeRFDataset:
         super().__init__()
 
         self.opt = opt
-        self.device = device
+        # self.device = device
+        self.device = 'cpu'
         self.type = type  # train, val, test
         self.downscale = downscale
         self.root_path = opt.path
         self.mode = opt.mode  # colmap, blender, llff
 
-        self.num_of_views = 5
+        self.num_of_views = 3
         self.radius = 1.0
         self.H = 256
         self.W = 256
@@ -132,7 +133,7 @@ class NeRFDataset:
         real_poses = rand_poses(self.num_of_views,
                                 self.device,
                                 radius=self.radius)
-        rays = get_rays_from_grids(real_poses, self.intrinsics, self.H, self.W,
+        rays = get_rays_from_grids(fake_poses, self.intrinsics, self.H, self.W,
                                    self.grid_size, self.iterations)
         # visualize_poses(poses.cpu().numpy(), size=0.1)
 
@@ -167,5 +168,5 @@ class NeRFDataset:
                             batch_size=1,
                             collate_fn=self.collate,
                             shuffle=True,
-                            num_workers=0)
+                            num_workers=8)
         return loader

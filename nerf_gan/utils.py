@@ -777,6 +777,8 @@ class Trainer(object):
                                    device=self.device))
 
         for it, data in enumerate(loader):
+            for key in ['rays_o', 'rays_d', 'rays_inds', 'mesh', 'real_poses', 'fake_poses']:
+                data[key] = data[key].to(self.device)
             with torch.inference_mode():
                 mesh = data['mesh'].extend(data['real_poses'].shape[0])
                 poses = data['real_poses']
@@ -803,10 +805,12 @@ class Trainer(object):
             self.local_step += 1
             self.global_step += 1
 
+            for p in self.model.parameters():
+                p.requires_grad = False
+            for p in self.discriminator.parameters():
+                p.requires_grad = True
             self.d_optimizer.zero_grad()
-
             z = torch.rand((1, self.latent_dim))
-
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 outputs = self.train_step(data, z)
                 d_loss_real = self.discriminator(data['images'],
@@ -826,6 +830,10 @@ class Trainer(object):
             d_loss_val = d_loss.item()
             total_loss += d_loss_val
 
+            for p in self.model.parameters():
+                p.requires_grad = True
+            for p in self.discriminator.parameters():
+                p.requires_grad = False
             self.g_optimizer.zero_grad()
             z = torch.rand((1, self.latent_dim))
             with torch.cuda.amp.autocast(enabled=self.fp16):
@@ -850,15 +858,14 @@ class Trainer(object):
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/d_loss", d_loss_val,
                                            self.global_step)
+                    self.writer.add_scalar("train/g_loss", g_loss_val,
+                                           self.global_step)
                     self.writer.add_scalar(
                         "train/d_lr", self.d_optimizer.param_groups[0]['lr'],
                         self.global_step)
                     self.writer.add_scalar(
                         "train/g_lr", self.g_optimizer.param_groups[0]['lr'],
                         self.global_step)
-                    if (it % self.critic_iter + 1) == 0:
-                        self.writer.add_scalar("train/g_loss", g_loss_val,
-                                               self.global_step)
 
                 pbar.set_description(
                     f"d_loss={d_loss_val:.4f} g_loss={g_loss_val:.4f} ({total_loss/self.local_step:.4f})"
