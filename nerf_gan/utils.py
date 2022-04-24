@@ -826,21 +826,21 @@ class Trainer(object):
             d_loss_val = d_loss.item()
             total_loss += d_loss_val
 
-            if (it % self.critic_iter) == 0:
-                self.g_optimizer.zero_grad()
-                z = torch.rand((1, self.latent_dim))
-                with torch.cuda.amp.autocast(enabled=self.fp16):
-                    outputs = self.train_step(data, z)
-                    g_loss = self.discriminator(outputs['image'],
-                                                data['fake_poses'])
-                self.scaler.scale(g_loss).backward()
-                self.scaler.step(self.g_optimizer)
-                self.scaler.update()
-                g_loss_val = g_loss.item()
-            else:
-                g_loss_val = 0.0
+            self.g_optimizer.zero_grad()
+            z = torch.rand((1, self.latent_dim))
+            with torch.cuda.amp.autocast(enabled=self.fp16):
+                outputs = self.train_step(data, z)
+                g_loss = self.discriminator(outputs['image'],
+                                            data['fake_poses'])
+            self.scaler.scale(g_loss).backward()
+            self.scaler.step(self.g_optimizer)
+            self.scaler.update()
+            g_loss_val = g_loss.item()
 
             total_loss += g_loss_val
+
+            self.g_lr_scheduler.step()
+            self.d_lr_scheduler.step()
 
             if self.local_rank == 0:
                 # if self.report_metric_at_train:
@@ -880,8 +880,6 @@ class Trainer(object):
                         metric.write(self.writer, self.epoch, prefix="train")
                     metric.clear()
 
-        self.g_lr_scheduler.step()
-        self.d_lr_scheduler.step()
         self.log(f"==> Finished Epoch {self.epoch}.")
 
     def evaluate_one_epoch(self, loader):

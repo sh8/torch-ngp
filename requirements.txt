@@ -3,8 +3,7 @@ ninja
 trimesh
 opencv-python
 tensorboardX
-torch
-numpy 
+numpy
 pandas
 tqdm
 matplotlib
