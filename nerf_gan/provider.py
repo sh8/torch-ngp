@@ -108,7 +108,7 @@ class NeRFDataset:
         self.root_path = opt.path
         self.mode = opt.mode  # colmap, blender, llff
 
-        self.num_of_views = 3
+        self.num_of_views = 1
         self.radius = 1.0
         self.H = 256
         self.W = 256

@@ -104,7 +104,7 @@ def get_rays_from_grids(poses,
                         W,
                         grid_size,
                         iterations,
-                        scale_anneal=0.0025,
+                        scale_anneal=0.025,
                         min_scale=0.25,
                         max_scale=1.0):
     ''' get rays
@@ -133,7 +133,7 @@ def get_rays_from_grids(poses,
         min_scale = min_scale
 
     i, j = torch.meshgrid(torch.linspace(0, H - 1, grid_size, device=device),
-                          torch.linspace(0, W - 1, grid_size, device=device))
+                          torch.linspace(0, W - 1, grid_size, device=device), indexing='ij')
 
     scale = torch.Tensor(1).uniform_(min_scale, max_scale)
     i = i * scale.to(device)
