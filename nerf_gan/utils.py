@@ -664,7 +664,6 @@ class Trainer(object):
 
         self.local_step = 0
 
-        blend_params = BlendParams(background_color=[0, 0, 0])
         lights = PointLights(device=self.device, location=[[0.0, 0.0, -3.0]])
         raster_settings = RasterizationSettings(
             image_size=256,
@@ -673,9 +672,7 @@ class Trainer(object):
         )
         renderer = MeshRenderer(
             rasterizer=MeshRasterizer(raster_settings=raster_settings),
-            shader=SoftPhongShader(blend_params=blend_params,
-                                   lights=lights,
-                                   device=self.device))
+            shader=SoftPhongShader(lights=lights, device=self.device))
 
         for it, data in enumerate(loader):
             for key in [
