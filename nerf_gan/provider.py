@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from pytorch3d.io import load_obj, load_objs_as_meshes
 from pytorch3d.renderer import TexturesVertex
 
-from .utils import get_rays_from_grids
+from .utils import get_rays_from_grids, get_rays
 
 
 # ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
@@ -133,19 +133,21 @@ class NeRFDataset:
         real_poses = rand_poses(self.num_of_views,
                                 self.device,
                                 radius=self.radius)
-        rays = get_rays_from_grids(fake_poses, self.intrinsics, self.H, self.W,
-                                   self.grid_size, self.iterations)
-        # visualize_poses(poses.cpu().numpy(), size=0.1)
 
-        obj_path = self.obj_paths[index[0]]
-
-        mesh = load_objs_as_meshes([obj_path],
-                                   load_textures=True,
-                                   create_texture_atlas=False,
-                                   device=self.device)
-        if mesh.textures is None:
-            mesh.textures = TexturesVertex(
-                torch.ones_like(mesh.verts_padded(), device=self.device))
+        if self.type == 'train':
+            rays = get_rays_from_grids(fake_poses, self.intrinsics, self.H,
+                                       self.W, self.grid_size, self.iterations)
+            obj_path = self.obj_paths[index[0]]
+            mesh = load_objs_as_meshes([obj_path],
+                                       load_textures=True,
+                                       create_texture_atlas=False,
+                                       device=self.device)
+            if mesh.textures is None:
+                mesh.textures = TexturesVertex(
+                    torch.ones_like(mesh.verts_padded(), device=self.device))
+        else:
+            rays = get_rays(fake_poses, self.intrinsics, self.H, self.W, -1)
+            mesh = None
 
         self.iterations += 1
         results = {

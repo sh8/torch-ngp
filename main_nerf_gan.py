@@ -166,27 +166,14 @@ if __name__ == '__main__':
                           model,
                           device=device,
                           workspace=opt.workspace,
-                          criterion=criterion,
                           fp16=opt.fp16,
                           metrics=[PSNRMeter()],
                           use_checkpoint='latest')
 
-        if opt.gui:
-            gui = NeRFGUI(opt, trainer)
-            gui.render()
+        test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
 
-        else:
-            test_loader = NeRFDataset(opt, device=device,
-                                      type='test').dataloader()
-
-            if opt.mode == 'blender':
-                trainer.evaluate(
-                    test_loader)  # blender has gt, so evaluate it.
-            else:
-                trainer.test(
-                    test_loader)  # colmap doesn't have gt, so just test.
-
-            trainer.save_mesh(resolution=256, threshold=10)
+        trainer.test(test_loader)  # colmap doesn't have gt, so just test.
+        # trainer.save_mesh(resolution=256, threshold=10)
 
     else:
 

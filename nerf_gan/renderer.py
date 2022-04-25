@@ -396,6 +396,7 @@ class NeRFRenderer(nn.Module):
                     n_alive, n_step, rays_alive[i % 2], rays_t[i % 2], rays_o,
                     rays_d, self.bound, self.density_grid, self.mean_density,
                     nears, fars, 128, perturb, dt_gamma)
+
                 z = z.repeat(xyzs.shape[0], 1)
                 z = z.to(device)
 
