@@ -534,9 +534,6 @@ class Trainer(object):
         rays_d = data['rays_d']  # [B, N, 3]
         H, W = data['H'], data['W']
 
-        if bg_color is not None:
-            bg_color = bg_color.to(self.device)
-
         outputs = self.model.render(z,
                                     rays_o,
                                     rays_d,
